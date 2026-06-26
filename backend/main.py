@@ -15,6 +15,15 @@ from schemas import (
     RejectApplication, StepCompletion, MessageCreate, InterviewStart, AnswerSubmit,
     AiInterviewOverrideRequest
 )
+from agents.agent_workflow import (
+    run_resume_screening,
+    run_resume_parsing,
+    generate_interview_questions,
+    review_interview_answers,
+    compute_skill_gap,
+    generate_next_interview_question,
+    evaluate_interview_transcript,
+)
 import socketio
 
 app = FastAPI(title="Talent Scout AI – MongoDB Backend")
@@ -175,6 +184,50 @@ async def login(payload: UserLogin):
     if not user:
         raise HTTPException(401, "Invalid email or password")
     return {"id": str(user["_id"]), "name": user["name"], "email": user["email"], "role": user["role"]}
+
+@app.post("/api/candidate/profile/{user_id}/resume")
+async def upload_resume(user_id: str, file: UploadFile = File(...)):
+    data = await file.read()
+    if file.filename.endswith(".pdf"):
+        text = extract_pdf(data)
+    else:
+        text = data.decode("utf-8", errors="ignore")
+    if not text.strip():
+        raise HTTPException(400, "Could not extract text from file")
+
+    parsed = {}
+    try:
+        parsed_state = await run_resume_parsing(text)
+        if parsed_state.get("errors"):
+            parsed = {}
+        else:
+            parsed = parsed_state.get("parsed_data", {})
+    except Exception:
+        parsed = {}
+
+    profile_update = {
+        "resume_text": text,
+        "resume_filename": file.filename,
+        "updated_at": now().isoformat(),
+        **_derive_profile_updates_from_parsed(parsed)
+    }
+
+    existing_profile = await db.candidate_profiles_col.find_one({"user_id": user_id}) or {}
+    merged = {**existing_profile, **profile_update}
+    fields = [
+        "current_role", "experience_years", "notice_period", "location", "salary_min", "salary_max",
+        "skills", "resume_text", "summary", "projects", "achievements"
+    ]
+    filled = sum(1 for f in fields if merged.get(f) and merged[f] not in [0, [], ""])
+    profile_update["profile_completeness"] = int((filled / len(fields)) * 100)
+
+    await db.candidate_profiles_col.update_one(
+        {"user_id": user_id},
+        {"$set": profile_update},
+        upsert=True
+    )
+
+    return {"success": True, "filename": file.filename, "chars": len(text), "parsed_data": parsed}
 
 
 
