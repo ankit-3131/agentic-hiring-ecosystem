@@ -256,6 +256,271 @@ async def upload_resume(user_id: str, file: UploadFile = File(...)):
 
     return {"success": True, "filename": file.filename, "chars": len(text), "parsed_data": parsed}
 
+@app.get("/api/candidate/agent-feed/{user_id}")
+async def get_agent_feed(user_id: str):
+    cursor = db.agent_activities_col.find({"candidate_id": user_id}).sort("timestamp", -1).limit(50)
+    docs = await cursor.to_list(50)
+    return _ids(docs)
+
+
+@app.post("/api/candidate/agent-feed/{user_id}/read-all")
+async def mark_feed_read(user_id: str):
+    await db.agent_activities_col.update_many({"candidate_id": user_id}, {"$set": {"read": True}})
+    return {"success": True}
+
+
+
+#candidate pipeline stages
+
+WORKFLOW_STAGES = ["applied", "ai_screen", "ai_interview", "human_screening", "offer"]
+
+@app.get("/api/candidate/pipeline/{user_id}")
+async def get_candidate_pipeline(user_id: str):
+    cursor = db.applications_col.find({"candidate_id": user_id})
+    apps = await cursor.to_list(200)
+    result = []
+    for app in apps:
+        app_id = str(app["_id"])
+        job = await db.jobs_col.find_one({"_id": ObjectId(app["job_id"])}) if app.get("job_id") else None
+        employer = None
+        if job and job.get("employer_id"):
+            employer = await db.users_col.find_one({"_id": ObjectId(job["employer_id"])})
+        result.append({
+            "application_id": app_id,
+            "job_id": app.get("job_id", ""),
+            "job_title": job["title"] if job else "Unknown",
+            "employer_name": job.get("employer_name", "") if job else "",
+            "location": job.get("location", "") if job else "",
+            "stage": app.get("stage", "applied"),
+            "match_score": app.get("match_score", 0),
+            "stage_history": app.get("stage_history", []),
+            "completed_steps": app.get("completed_steps", []),
+            "workflow_stages": WORKFLOW_STAGES,
+            "created_at": app.get("created_at", ""),
+            "feedback": app.get("feedback", {}),
+        })
+    return result
+
+@app.post("/api/candidate/apply")
+async def apply_to_job(
+    candidateId: str = Form(...),
+    jobId: str = Form(...),
+):
+    try:
+        job = await db.jobs_col.find_one({"_id": ObjectId(jobId)})
+    except Exception:
+        raise HTTPException(400, "Invalid jobId")
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    # Fetch resume_text from stored candidate profile
+    profile = await db.candidate_profiles_col.find_one({"user_id": candidateId})
+    if not profile or not profile.get("resume_text"):
+        raise HTTPException(400, "Please upload your resume in the Profile tab first.")
+    
+    resume_text = profile.get("resume_text", "")
+    if not resume_text.strip():
+        raise HTTPException(400, "Resume is empty. Please upload a valid resume.")
+
+    existing = await db.applications_col.find_one({"candidate_id": candidateId, "job_id": jobId})
+
+    REAPPLYABLE_STAGES = {"rejected", "withdrawn"}
+    ACTIVE_STAGES = {"applied", "ai_screen", "ai_interview", "human_screening", "offer"}
+
+    if existing:
+        existing_stage = existing.get("stage", "applied")
+        if existing_stage in ACTIVE_STAGES:
+            # Block reapply for any ongoing application
+            raise HTTPException(409, f"You already have an active application for this job (stage: {existing_stage}). You cannot reapply while it is in progress.")
+        # For rejected/withdrawn: fall through to re-run screening (no cache)
+
+    if existing and existing.get("match_score") is not None and existing.get("stage", "") not in REAPPLYABLE_STAGES:
+        # Use cached score and feedback only for non-rejected, non-withdrawn existing apps
+        score = existing.get("match_score", 0)
+        feedback = existing.get("feedback", {})
+        parsed = existing.get("parsed_data", {})
+        app_id = str(existing["_id"])
+        await db.applications_col.update_one(
+            {"_id": existing["_id"]},
+            {
+                "$set": {
+                    "resume_text": resume_text,
+                    "stage": existing.get("stage", "applied"),
+                    "updated_at": now().isoformat(),
+                }
+            }
+        )
+        profile_updates = {
+            "resume_text": resume_text,
+            "updated_at": now().isoformat(),
+            **_derive_profile_updates_from_parsed(parsed)
+        }
+        existing_profile = await db.candidate_profiles_col.find_one({"user_id": candidateId}) or {}
+        merged_profile = {**existing_profile, **profile_updates}
+        fields = [
+            "current_role", "experience_years", "notice_period", "location", "salary_min", "salary_max",
+            "skills", "resume_text", "summary", "projects", "achievements"
+        ]
+        filled = sum(1 for f in fields if merged_profile.get(f) and merged_profile[f] not in [0, [], ""])
+        profile_updates["profile_completeness"] = int((filled / len(fields)) * 100)
+
+        await db.candidate_profiles_col.update_one(
+            {"user_id": candidateId},
+            {"$setOnInsert": {"user_id": candidateId}, "$set": profile_updates},
+            upsert=True
+        )
+        return {"success": True, "application_id": app_id, "parsedData": parsed, "scoringResult": feedback, "cached": True}
+
+    result = await run_resume_screening(resume_text, job["description"])
+    if result.get("errors"):
+        raise HTTPException(500, result["errors"][0])
+
+    score = result.get("scoring_result", {}).get("score", 0)
+    feedback = result.get("scoring_result", {})
+    parsed = result.get("parsed_data", {})
+
+    # Determine next stage based on score
+    if score > 25:
+        next_stage = "ai_interview"
+        stage_history = [
+            {"stage": "applied", "timestamp": now().isoformat()},
+            {"stage": "ai_screen", "timestamp": now().isoformat()},
+            {"stage": "ai_interview", "timestamp": now().isoformat()}
+        ]
+    else:
+        next_stage = "rejected"
+        stage_history = [
+            {"stage": "applied", "timestamp": now().isoformat()},
+            {"stage": "ai_screen", "timestamp": now().isoformat()},
+            {"stage": "rejected", "timestamp": now().isoformat()}
+        ]
+
+    # Upsert application (new or rewrite with latest data)
+    app_doc = {
+        "candidate_id": candidateId,
+        "job_id": jobId,
+        "stage": next_stage,
+        "match_score": score,
+        "feedback": feedback,
+        "resume_text": resume_text,
+        "parsed_data": parsed,
+        "stage_history": stage_history,
+        "completed_steps": [],
+        "created_at": now().isoformat(),
+        "updated_at": now().isoformat(),
+    }
+    if existing:
+        await db.applications_col.update_one({"_id": existing["_id"]}, {"$set": app_doc})
+        app_id = str(existing["_id"])
+    else:
+        res = await db.applications_col.insert_one(app_doc)
+        app_id = str(res.inserted_id)
+
+    # Update candidate profile from parsed resume data
+    profile_updates = {
+        "resume_text": resume_text,
+        "updated_at": now().isoformat(),
+        **_derive_profile_updates_from_parsed(parsed)
+    }
+    existing_profile = await db.candidate_profiles_col.find_one({"user_id": candidateId}) or {}
+    merged_profile = {**existing_profile, **profile_updates}
+    fields = [
+        "current_role", "experience_years", "notice_period", "location", "salary_min", "salary_max",
+        "skills", "resume_text", "summary", "projects", "achievements"
+    ]
+    filled = sum(1 for f in fields if merged_profile.get(f) and merged_profile[f] not in [0, [], ""])
+    profile_updates["profile_completeness"] = int((filled / len(fields)) * 100)
+
+    await db.candidate_profiles_col.update_one(
+        {"user_id": candidateId},
+        {"$setOnInsert": {"user_id": candidateId}, "$set": profile_updates},
+        upsert=True
+    )
+
+    # Log agent activity based on outcome
+    cand_user = await db.users_col.find_one({"_id": ObjectId(candidateId)})
+    if next_stage == "ai_interview":
+        await db.agent_activities_col.insert_one({
+            "candidate_id": candidateId,
+            "type": "stage_update",
+            "message": f"Advanced to AI Interview for {job['title']} — {score}/100 match score",
+            "job_id": jobId,
+            "job_title": job["title"],
+            "timestamp": now().isoformat(),
+            "read": False,
+        })
+    else:  # rejected
+        await db.agent_activities_col.insert_one({
+            "candidate_id": candidateId,
+            "type": "rejected",
+            "message": f"Application for {job['title']} was not moved forward — {score}/100 match score",
+            "job_id": jobId,
+            "job_title": job["title"],
+            "timestamp": now().isoformat(),
+            "read": False,
+        })
+
+    return {"success": True, "application_id": app_id, "parsedData": parsed, "scoringResult": feedback}
+
+@app.get("/api/candidate/skill-gap/{user_id}")
+async def get_skill_gap(user_id: str):
+    profile = await db.candidate_profiles_col.find_one({"user_id": user_id})
+    if not profile:
+        return {"gaps": [], "recommendations": []}
+    candidate_skills = profile.get("skills", [])
+
+    # Get all matched jobs
+    cursor = db.applications_col.find({"candidate_id": user_id, "stage": {"$ne": "rejected"}})
+    apps = await cursor.to_list(20)
+    job_descriptions = []
+    for app in apps:
+        if app.get("job_id"):
+            try:
+                job = await db.jobs_col.find_one({"_id": ObjectId(app["job_id"])})
+                if job:
+                    job_descriptions.append({"title": job["title"], "description": job["description"]})
+            except Exception:
+                pass
+
+    if not job_descriptions:
+        return {"gaps": [], "recommendations": ["Apply to jobs to see your skill gap analysis"]}
+
+    result = await compute_skill_gap(candidate_skills, job_descriptions)
+    return result
+@app.get("/api/candidate/consent/{user_id}")
+async def get_consent(user_id: str):
+    profile = await db.candidate_profiles_col.find_one({"user_id": user_id})
+    if not profile:
+        return {"share_profile": True, "agent_active": True, "salary_visible": True, "agency_visible": True}
+    return profile.get("consent", {"share_profile": True, "agent_active": True, "salary_visible": True, "agency_visible": True})
+
+
+@app.put("/api/candidate/consent/{user_id}")
+async def update_consent(user_id: str, payload: ConsentUpdate):
+    update = {k: v for k, v in payload.model_dump().items() if v is not None}
+    consent_update = {f"consent.{k}": v for k, v in update.items()}
+    await db.candidate_profiles_col.update_one(
+        {"user_id": user_id}, {"$set": consent_update}, upsert=True
+    )
+    profile = await db.candidate_profiles_col.find_one({"user_id": user_id})
+    return profile.get("consent", {})
+
+
+@app.post("/api/candidate/withdraw/{application_id}")
+async def withdraw_from_pipeline(application_id: str, user_id: str):
+    try:
+        app = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid application_id")
+    if not app:
+        raise HTTPException(404, "Application not found")
+    if app["candidate_id"] != user_id:
+        raise HTTPException(403, "Forbidden")
+    await db.applications_col.update_one(
+        {"_id": ObjectId(application_id)},
+        {"$set": {"stage": "withdrawn", "withdrawn_at": now().isoformat()}}
+    )
+    return {"success": True}
 
 
 if __name__ == "__main__":
