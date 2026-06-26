@@ -523,6 +523,402 @@ async def withdraw_from_pipeline(application_id: str, user_id: str):
     return {"success": True}
 
 
+#communication endpoints
+
+@app.get("/api/candidate/messages/{user_id}")
+async def get_candidate_messages(user_id: str):
+    cursor = db.messages_col.find({
+        "$or": [
+            {"to_id": user_id},
+            {"from_id": user_id},
+        ]
+    }).sort("timestamp", 1)
+    msgs = await cursor.to_list(200)
+    # Group by application_id
+    grouped: dict = {}
+    for m in msgs:
+        aid = m.get("application_id", "")
+        if aid not in grouped:
+            grouped[aid] = {"application_id": aid, "job_title": m.get("job_title", ""), "messages": []}
+        grouped[aid]["messages"].append({
+            "id": str(m["_id"]),
+            "from_id": m.get("from_id", ""),
+            "from_name": m.get("from_name", ""),
+            "content": m.get("content", ""),
+            "type": m.get("msg_type", "message"),
+            "msg_type": m.get("msg_type", "message"),
+            "timestamp": m.get("timestamp", ""),
+            "read": m.get("read", False),
+        })
+    return list(grouped.values())
+
+
+@app.post("/api/candidate/messages/{application_id}/reply")
+async def candidate_reply(application_id: str, payload: MessageCreate, user_id: str):
+    app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    if not app_doc:
+        raise HTTPException(404, "Application not found")
+    if app_doc.get("candidate_id") != user_id:
+        raise HTTPException(403, "You cannot reply to this application")
+    sender = await db.users_col.find_one({"_id": ObjectId(user_id)})
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc["job_id"])})
+    msg = {
+        "application_id": application_id,
+        "from_id": user_id,
+        "from_name": sender["name"] if sender else "Candidate",
+        "to_id": job["employer_id"] if job else "",
+        "content": payload.content,
+        "msg_type": payload.msg_type,
+        "job_title": job["title"] if job else "",
+        "timestamp": now().isoformat(),
+        "read": False,
+    }
+    ins = await db.messages_col.insert_one(msg)
+    msg["_id"] = ins.inserted_id
+    await emit_new_message(msg)
+    return {"success": True}
+
+
+@app.post("/api/messages/{message_id}/read")
+async def mark_message_read(message_id: str):
+    await db.messages_col.update_one({"_id": ObjectId(message_id)}, {"$set": {"read": True}})
+    return {"success": True}
+
+
+@app.post("/api/candidate/mock-interview/start")
+async def start_interview(payload: InterviewStart):
+    MAX_QUESTIONS = 7
+    app_doc = await db.applications_col.find_one({"_id": ObjectId(payload.application_id)})
+    if not app_doc:
+        raise HTTPException(404, "Application not found")
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc["job_id"])})
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+                                            
+    existing = await db.interview_sessions_col.find_one({
+        "application_id": payload.application_id,
+        "status": "in_progress"
+    })
+    if existing:
+                                                                          
+        legacy_mode = "answer_timestamps" not in existing
+        total = len(existing.get("questions", [])) if legacy_mode else MAX_QUESTIONS
+        return {
+            "session_id": str(existing["_id"]),
+            "question": existing["questions"][existing["current_index"]],
+            "index": existing["current_index"],
+            "total": total,
+        }
+
+    persona = "You are a friendly but rigorous interviewer. Ask one question at a time, follow up when needed, and keep the conversation focused and respectful."
+    estimated_duration_minutes = 20
+
+                                                                  
+    first = await generate_next_interview_question(
+        job_title=job["title"],
+        job_description=job["description"],
+        persona=persona,
+        questions=[],
+        answers=[],
+        timestamps=[],
+        next_question_index=0,
+        max_questions=MAX_QUESTIONS,
+    )
+
+    session_doc = {
+        "application_id": payload.application_id,
+        "candidate_id": payload.candidate_id,
+        "job_id": str(job["_id"]),
+        "job_title": job["title"],
+        "job_description": job["description"],
+        "persona": persona,
+        "estimated_duration_minutes": estimated_duration_minutes,
+        "questions": [first["question"]],
+        "answers": [],
+        "answer_timestamps": [],
+        "status": "in_progress",
+        "current_index": 0,
+        "started_at": now().isoformat(),
+        "created_at": now().isoformat(),
+                                              
+        "reviews": [],
+        "overall_feedback": "",
+        "gap_score": 0,
+                                                             
+        "overall_score": None,
+        "dimension_scores": None,
+        "notable_quotes": [],
+        "interview_report": None,
+        "recommendation": None,
+        "recommendation_reasoning": "",
+        "transcript": [],
+        "completed_at": None,
+    }
+    res = await db.interview_sessions_col.insert_one(session_doc)
+    return {
+        "session_id": str(res.inserted_id),
+        "question": first["question"],
+        "index": 0,
+        "total": MAX_QUESTIONS,
+    }
+
+
+@app.post("/api/candidate/mock-interview/{session_id}/answer")
+async def submit_answer(session_id: str, payload: AnswerSubmit):
+    session = await db.interview_sessions_col.find_one({"_id": ObjectId(session_id)})
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session["status"] != "in_progress":
+        raise HTTPException(400, "Session already completed")
+
+                                 
+    legacy_mode = "answer_timestamps" not in session
+    MAX_QUESTIONS = 7
+
+    if legacy_mode:
+        answers = session.get("answers", [])
+        answers.append(payload.answer)
+        next_index = session["current_index"] + 1
+        total = len(session["questions"])
+
+        await db.interview_sessions_col.update_one(
+            {"_id": ObjectId(session_id)},
+            {"$set": {"answers": answers, "current_index": next_index}}
+        )
+
+        if next_index >= total:
+                                           
+            reviews, overall, gap_score = await review_interview_answers(
+                session["questions"], answers, session.get("job_title", "")
+            )
+            await db.interview_sessions_col.update_one(
+                {"_id": ObjectId(session_id)},
+                {"$set": {"reviews": reviews, "overall_feedback": overall, "gap_score": gap_score, "status": "completed"}}
+            )
+            return {"done": True, "reviews": reviews, "overall_feedback": overall, "gap_score": gap_score}
+
+        return {"done": False, "question": session["questions"][next_index], "index": next_index, "total": total}
+
+                                 
+    questions = session.get("questions", [])
+    answers = session.get("answers", [])
+    timestamps = session.get("answer_timestamps", [])
+    current_index = session.get("current_index", 0)
+
+    answers.append(payload.answer)
+    timestamps.append(now().isoformat())
+
+    next_index = current_index + 1
+    persona = session.get("persona", "You are a senior technical interviewer.")
+    job_title = session.get("job_title", "")
+    job_description = session.get("job_description", "")
+
+                       
+    should_complete = next_index >= MAX_QUESTIONS
+    generated_next = None
+
+    if not should_complete:
+        generated_next = await generate_next_interview_question(
+            job_title=job_title,
+            job_description=job_description,
+            persona=persona,
+            questions=questions,
+            answers=answers,
+            timestamps=timestamps,
+            next_question_index=next_index,
+            max_questions=MAX_QUESTIONS,
+        )
+        should_complete = bool(generated_next.get("should_end", False))
+
+                                                                                        
+    if not should_complete and generated_next and generated_next.get("question"):
+        questions = questions + [generated_next["question"]]
+        status = "in_progress"
+        current_index_to_store = next_index
+        update_payload = {
+            "$set": {
+                "answers": answers,
+                "answer_timestamps": timestamps,
+                "questions": questions,
+                "status": status,
+                "current_index": current_index_to_store,
+            }
+        }
+        await db.interview_sessions_col.update_one({"_id": ObjectId(session_id)}, update_payload)
+        return {
+            "done": False,
+            "question": generated_next["question"],
+            "index": next_index,
+            "total": MAX_QUESTIONS,
+        }
+
+                                                                   
+    evaluation = await evaluate_interview_transcript(
+        job_title=job_title,
+        job_description=job_description,
+        persona=persona,
+        questions=questions,
+        answers=answers,
+        timestamps=timestamps,
+    )
+
+    overall_score = evaluation.get("overall_score", 0)
+    dimension_scores = evaluation.get("dimension_scores", {})
+    transcript = evaluation.get("transcript", [])
+    notable_quotes = evaluation.get("notable_quotes", [])
+    recommendation = evaluation.get("recommendation", "hold")
+    recommendation_reasoning = evaluation.get("recommendation_reasoning", "")
+
+                                                           
+    reviews = [
+        {
+            "question": t.get("question", ""),
+            "answer": t.get("answer", ""),
+            "correct": True,
+            "score": overall_score,
+            "review": "See structured interview report for full evaluation details.",
+        }
+        for t in transcript
+    ]
+
+    await db.interview_sessions_col.update_one(
+        {"_id": ObjectId(session_id)},
+        {
+            "$set": {
+                "answers": answers,
+                "answer_timestamps": timestamps,
+                "questions": questions,
+                "status": "completed",
+                "completed_at": now().isoformat(),
+                "overall_score": overall_score,
+                "dimension_scores": dimension_scores,
+                "transcript": transcript,
+                "notable_quotes": notable_quotes,
+                "recommendation": recommendation,
+                "recommendation_reasoning": recommendation_reasoning,
+                "interview_report": evaluation,
+                               
+                "reviews": reviews,
+                "overall_feedback": recommendation_reasoning,
+                "gap_score": overall_score,
+            }
+        },
+    )
+
+                                                                                    
+    app_id = session.get("application_id", "")
+    if app_id:
+        try:
+            app_doc = await db.applications_col.find_one({"_id": ObjectId(app_id)}) or {}
+            if app_doc:
+                                                           
+                job = await db.jobs_col.find_one({"_id": ObjectId(app_doc.get("job_id"))}) if app_doc.get("job_id") else None
+                employer_id = job.get("employer_id") if job else ""
+                thresholds_doc = await db.employer_ai_interview_thresholds_col.find_one({"employer_id": employer_id})
+                thresholds = thresholds_doc or {
+                    "reject_cutoff": DEFAULT_AI_INTERVIEW_THRESHOLDS["reject_cutoff"],
+                    "hold_cutoff": DEFAULT_AI_INTERVIEW_THRESHOLDS["hold_cutoff"],
+                    "pass_cutoff": DEFAULT_AI_INTERVIEW_THRESHOLDS["pass_cutoff"],
+                }
+
+                REJECT_CUTOFF = int(thresholds.get("reject_cutoff", DEFAULT_AI_INTERVIEW_THRESHOLDS["reject_cutoff"]))
+                HOLD_CUTOFF = int(thresholds.get("hold_cutoff", DEFAULT_AI_INTERVIEW_THRESHOLDS["hold_cutoff"]))
+                PASS_CUTOFF = int(thresholds.get("pass_cutoff", DEFAULT_AI_INTERVIEW_THRESHOLDS["pass_cutoff"]))
+
+                if overall_score < REJECT_CUTOFF:
+                    target_stage = "rejected"
+                    auto_recommendation = "hold"                                            
+                elif overall_score < HOLD_CUTOFF:
+                    target_stage = "human_screening"
+                    auto_recommendation = "hold"
+                elif overall_score < PASS_CUTOFF:
+                    target_stage = "human_screening"
+                    auto_recommendation = "advance"
+                else:
+                    target_stage = "human_screening"
+                    auto_recommendation = "pass"
+
+                                                                                                 
+                await db.applications_col.update_one(
+                    {"_id": ObjectId(app_id)},
+                    {
+                        "$set": {
+                            "interview_score": overall_score,
+                            "ai_score": overall_score,
+                            "last_updated": now().isoformat(),
+                            "overridden_by_employer": bool(app_doc.get("overridden_by_employer", False)),
+                        }
+                    },
+                )
+
+                if not app_doc.get("overridden_by_employer", False):
+                    stage_note = f"AI interview score {overall_score}/100 -> moved to {target_stage}"
+                    stage_history = app_doc.get("stage_history", [])
+                    stage_history = list(stage_history) + [{"stage": target_stage, "timestamp": now().isoformat(), "note": stage_note}]
+
+                    await db.applications_col.update_one(
+                        {"_id": ObjectId(app_id)},
+                        {
+                            "$set": {
+                                "stage": target_stage,
+                                "recommendation": auto_recommendation,
+                                "recommendation_reasoning": recommendation_reasoning,
+                            },
+                        },
+                    )
+                                                                                         
+                    await db.applications_col.update_one(
+                        {"_id": ObjectId(app_id)},
+                        {"$set": {"stage_history": stage_history}},
+                    )
+
+                    cand_user_id = app_doc.get("candidate_id", "")
+                    await db.agent_activities_col.insert_one({
+                        "candidate_id": cand_user_id,
+                        "type": "ai_interview_evaluated",
+                        "message": f"AI Interview completed: {overall_score}/100 (AI recommends {auto_recommendation}).",
+                        "job_id": str(job["_id"]) if job else session.get("job_id", ""),
+                        "job_title": job.get("title", "") if job else session.get("job_title", ""),
+                        "timestamp": now().isoformat(),
+                        "read": False,
+                    })
+        except Exception:
+                                                                                   
+            pass
+
+    return {
+        "done": True,
+        "interview_report": evaluation,
+        "overall_score": overall_score,
+        "dimension_scores": dimension_scores,
+        "notable_quotes": notable_quotes,
+        "recommendation": recommendation,
+        "recommendation_reasoning": recommendation_reasoning,
+        "transcript": transcript,
+                       
+        "reviews": reviews,
+        "overall_feedback": recommendation_reasoning,
+        "gap_score": overall_score,
+    }
+
+
+@app.get("/api/candidate/mock-interview/{session_id}")
+async def get_interview_session(session_id: str):
+    session = await db.interview_sessions_col.find_one({"_id": ObjectId(session_id)})
+    if not session:
+        raise HTTPException(404, "Session not found")
+    return _id(session)
+
+
+@app.get("/api/candidate/mock-interviews/{candidate_id}")
+async def list_interview_sessions(candidate_id: str):
+    cursor = db.interview_sessions_col.find({"candidate_id": candidate_id}).sort("created_at", -1)
+    sessions = await cursor.to_list(50)
+    return _ids(sessions)
+
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:socket_app", host="0.0.0.0", port=8000, reload=True)
