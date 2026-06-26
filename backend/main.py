@@ -185,6 +185,33 @@ async def login(payload: UserLogin):
         raise HTTPException(401, "Invalid email or password")
     return {"id": str(user["_id"]), "name": user["name"], "email": user["email"], "role": user["role"]}
 
+@app.get("/api/candidate/profile/{user_id}")
+async def get_candidate_profile(user_id: str):
+    profile = await db.candidate_profiles_col.find_one({"user_id": user_id})
+    if not profile:
+        return {}
+    return _id(profile)
+
+
+@app.put("/api/candidate/profile/{user_id}")
+async def upsert_candidate_profile(user_id: str, payload: CandidateProfileUpdate):
+    update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    update_data["updated_at"] = now().isoformat()
+    profile = await db.candidate_profiles_col.find_one({"user_id": user_id}) or {}
+    merged = {**profile, **update_data}
+    fields = [
+        "current_role", "experience_years", "notice_period", "location", "salary_min", "salary_max",
+        "skills", "resume_text", "summary", "projects", "achievements"
+    ]
+    filled = sum(1 for f in fields if merged.get(f) and merged[f] not in [0, [], ""])
+    update_data["profile_completeness"] = int((filled / len(fields)) * 100)
+    await db.candidate_profiles_col.update_one(
+        {"user_id": user_id}, {"$set": update_data}, upsert=True
+    )
+    profile = await db.candidate_profiles_col.find_one({"user_id": user_id})
+    return _id(profile)
+
+
 @app.post("/api/candidate/profile/{user_id}/resume")
 async def upload_resume(user_id: str, file: UploadFile = File(...)):
     data = await file.read()
