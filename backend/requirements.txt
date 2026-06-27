@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-socketio
+motor
+pymongo
+certifi
+python-multipart
+PyPDF2
+python-dotenv
+langchain-google-genai
+langchain-core
+langgraph
