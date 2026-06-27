@@ -917,6 +917,416 @@ async def list_interview_sessions(candidate_id: str):
     sessions = await cursor.to_list(50)
     return _ids(sessions)
 
+FIXED_STAGES = ["applied", "ai_screen", "ai_interview", "human_screening", "offer"]
+
+@app.post("/api/employer/jobs")
+async def create_job(payload: JobCreate):
+    employer = await db.users_col.find_one({"_id": ObjectId(payload.employer_id)})
+    doc = payload.model_dump()
+    doc["employer_name"] = employer["name"] if employer else payload.employer_name
+    doc["status"] = "active"
+    doc["created_at"] = now().isoformat()
+    doc["agency_name"] = ""
+    doc["agency_scope"] = ""
+    doc["hitl_steps"] = []
+    res = await db.jobs_col.insert_one(doc)
+    job = await db.jobs_col.find_one({"_id": res.inserted_id})
+    return _id(job)
+
+DEFAULT_AI_INTERVIEW_THRESHOLDS = {
+    "reject_cutoff": 60,  # score < reject_cutoff => rejected
+    "hold_cutoff": 70,    # reject_cutoff <= score < hold_cutoff => hold
+    "pass_cutoff": 80,    # score >= pass_cutoff => pass
+}
+
+
+@app.get("/api/employer/ai-interview-thresholds/{employer_id}")
+async def get_ai_interview_thresholds(employer_id: str):
+    doc = await db.employer_ai_interview_thresholds_col.find_one({"employer_id": employer_id})
+    if not doc:
+        return {"employer_id": employer_id, **DEFAULT_AI_INTERVIEW_THRESHOLDS}
+    return _id(doc)
+
+
+@app.put("/api/employer/ai-interview-thresholds/{employer_id}")
+async def set_ai_interview_thresholds(employer_id: str, payload: dict):
+    reject_cutoff = int(payload.get("reject_cutoff", DEFAULT_AI_INTERVIEW_THRESHOLDS["reject_cutoff"]))
+    hold_cutoff = int(payload.get("hold_cutoff", DEFAULT_AI_INTERVIEW_THRESHOLDS["hold_cutoff"]))
+    pass_cutoff = int(payload.get("pass_cutoff", DEFAULT_AI_INTERVIEW_THRESHOLDS["pass_cutoff"]))
+
+    # Basic sanity checks for ordering and bounds.
+    if not (0 <= reject_cutoff <= 100 and 0 <= hold_cutoff <= 100 and 0 <= pass_cutoff <= 100):
+        raise HTTPException(400, "Thresholds must be between 0 and 100")
+    if not (reject_cutoff <= hold_cutoff <= pass_cutoff):
+        raise HTTPException(400, "Thresholds must satisfy reject_cutoff <= hold_cutoff <= pass_cutoff")
+
+    update = {
+        "employer_id": employer_id,
+        "reject_cutoff": reject_cutoff,
+        "hold_cutoff": hold_cutoff,
+        "pass_cutoff": pass_cutoff,
+        "updated_at": now().isoformat(),
+    }
+    await db.employer_ai_interview_thresholds_col.update_one(
+        {"employer_id": employer_id},
+        {"$set": update},
+        upsert=True,
+    )
+    doc = await db.employer_ai_interview_thresholds_col.find_one({"employer_id": employer_id})
+    return _id(doc)
+
+
+@app.get("/api/employer/jobs")
+async def get_employer_jobs(employer_id: str):
+    cursor = db.jobs_col.find({"employer_id": employer_id}).sort("created_at", -1)
+    jobs = await cursor.to_list(100)
+    result = []
+    for job in _ids(jobs):
+        job_id = job["id"]
+        try:
+            counts = await _get_stage_counts(job_id)
+        except Exception:
+            counts = {}
+        job["stage_counts"] = counts
+        result.append(job)
+    return result
+
+
+@app.get("/api/jobs")
+async def get_all_jobs():
+    cursor = db.jobs_col.find({"status": "active"}).sort("created_at", -1)
+    jobs = await cursor.to_list(200)
+    return _ids(jobs)
+
+
+@app.get("/api/employer/jobs/{job_id}")
+async def get_job_detail(job_id: str):
+    try:
+        job = await db.jobs_col.find_one({"_id": ObjectId(job_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid job_id")
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return _id(job)
+
+
+@app.put("/api/employer/jobs/{job_id}")
+async def update_job(job_id: str, payload: JobUpdate):
+    update = {k: v for k, v in payload.model_dump().items() if v is not None}
+    await db.jobs_col.update_one({"_id": ObjectId(job_id)}, {"$set": update})
+    job = await db.jobs_col.find_one({"_id": ObjectId(job_id)})
+    return _id(job)
+
+
+@app.put("/api/employer/jobs/{job_id}/agency")
+async def assign_agency(job_id: str, payload: AgencyAssign):
+    await db.jobs_col.update_one({"_id": ObjectId(job_id)}, {"$set": {
+        "agency_name": payload.agency_name,
+        "agency_scope": payload.agency_scope,
+        "hitl_steps": payload.hitl_steps,
+    }})
+    return {"success": True}
+
+
+@app.get("/api/employer/jobs/{job_id}/shortlist")
+async def get_shortlist(job_id: str, limit: int = 50):
+    cursor = db.applications_col.find({"job_id": job_id, "stage": {"$ne": "rejected"}}).sort("match_score", -1).limit(limit)
+    apps = await cursor.to_list(limit)
+    result = []
+    for app in apps:
+        cand = await db.users_col.find_one({"_id": ObjectId(app["candidate_id"])})
+        profile = await db.candidate_profiles_col.find_one({"user_id": app["candidate_id"]})
+        session = await db.interview_sessions_col.find_one({"application_id": str(app["_id"]), "status": "completed"})
+        result.append({
+            "application_id": str(app["_id"]),
+            "candidate_id": app["candidate_id"],
+            "name": cand["name"] if cand else "Unknown",
+            "email": cand["email"] if cand else "",
+            "match_score": app.get("match_score", 0),
+            "stage": app.get("stage", "matched"),
+            "skills": profile.get("skills", []) if profile else [],
+            "location": profile.get("location", "") if profile else "",
+            "experience_years": profile.get("experience_years", 0) if profile else 0,
+            "gap_score": session.get("gap_score", 0) if session else None,
+            "completed_steps": app.get("completed_steps", []),
+            "feedback": app.get("feedback", {}),
+        })
+    return result
+
+@app.get("/api/employer/candidate/{application_id}")
+async def get_candidate_deepview(application_id: str):
+    try:
+        app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid application_id")
+    if not app_doc:
+        raise HTTPException(404, "Application not found")
+
+    cand = await db.users_col.find_one({"_id": ObjectId(app_doc["candidate_id"])})
+    profile = await db.candidate_profiles_col.find_one({"user_id": app_doc["candidate_id"]})
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc["job_id"])})
+    sessions_cursor = db.interview_sessions_col.find({"application_id": application_id}).sort("created_at", -1)
+    sessions = await sessions_cursor.to_list(10)
+
+    latest_completed = next((s for s in sessions if s.get("status") == "completed"), None)
+    latest_report = None
+    if latest_completed:
+        # Prefer the explicit report blob if available, otherwise derive from top-level fields.
+        latest_report = latest_completed.get("interview_report") or {
+            "overall_score": latest_completed.get("overall_score", 0),
+            "dimension_scores": latest_completed.get("dimension_scores", {}),
+            "transcript": latest_completed.get("transcript", []),
+            "notable_quotes": latest_completed.get("notable_quotes", []),
+            "recommendation": latest_completed.get("recommendation", "hold"),
+            "recommendation_reasoning": latest_completed.get("recommendation_reasoning", ""),
+        }
+
+    override_audits_cursor = db.ai_interview_override_audit_col.find({"application_id": application_id}).sort("timestamp", -1).limit(20)
+    override_audits = await override_audits_cursor.to_list(20)
+
+    return {
+        "application": {
+            "id": str(app_doc["_id"]),
+            "stage": app_doc.get("stage", ""),
+            "match_score": app_doc.get("match_score", 0),
+            "stage_history": app_doc.get("stage_history", []),
+            "completed_steps": app_doc.get("completed_steps", []),
+            "feedback": app_doc.get("feedback", {}),
+            "parsed_data": app_doc.get("parsed_data", {}),
+            "ai_score": app_doc.get("ai_score", None),
+            "interview_score": app_doc.get("interview_score", None),
+            "recommendation": app_doc.get("recommendation", None),
+            "recommendation_reasoning": app_doc.get("recommendation_reasoning", ""),
+            "overridden_by_employer": app_doc.get("overridden_by_employer", False),
+        },
+        "candidate": {"id": str(cand["_id"]), "name": cand["name"], "email": cand["email"]} if cand else {},
+        "profile": _id(profile) if profile else {},
+        "job": _id(job) if job else {},
+        "latest_ai_interview_report": latest_report,
+        "ai_interview_override_audits": _ids(override_audits),
+        "interview_sessions": [_id(s) for s in sessions],
+    }
+@app.put("/api/employer/applications/{application_id}/stage")
+async def update_stage(application_id: str, payload: StageUpdate):
+    try:
+        app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid application_id")
+    if not app_doc:
+        raise HTTPException(404, "Not found")
+
+    history = app_doc.get("stage_history", [])
+    history.append({"stage": payload.stage, "timestamp": now().isoformat(), "note": payload.note})
+    await db.applications_col.update_one(
+        {"_id": ObjectId(application_id)},
+        {"$set": {"stage": payload.stage, "stage_history": history}}
+    )
+
+    # Notify candidate via agent feed
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc["job_id"])})
+    await db.agent_activities_col.insert_one({
+        "candidate_id": app_doc["candidate_id"],
+        "type": "stage_update",
+        "message": f"Stage updated to '{payload.stage}' for {job['title'] if job else 'a role'}",
+        "job_id": app_doc["job_id"],
+        "job_title": job["title"] if job else "",
+        "timestamp": now().isoformat(),
+        "read": False,
+    })
+    return {"success": True, "stage": payload.stage}
+
+
+@app.put("/api/employer/applications/{application_id}/complete-step")
+async def complete_step(application_id: str, payload: StepCompletion):
+    app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    if not app_doc:
+        raise HTTPException(404, "Not found")
+    completed = app_doc.get("completed_steps", [])
+    if payload.completed and payload.step_id not in completed:
+        completed.append(payload.step_id)
+    elif not payload.completed and payload.step_id in completed:
+        completed.remove(payload.step_id)
+    await db.applications_col.update_one(
+        {"_id": ObjectId(application_id)},
+        {"$set": {"completed_steps": completed}}
+    )
+    return {"success": True, "completed_steps": completed}
+
+
+@app.post("/api/employer/applications/{application_id}/reject")
+async def reject_application(application_id: str, payload: RejectApplication, employer_id: str):
+    try:
+        app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid application_id")
+    if not app_doc:
+        raise HTTPException(404, "Not found")
+
+    employer = await db.users_col.find_one({"_id": ObjectId(employer_id)})
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc["job_id"])})
+    history = app_doc.get("stage_history", [])
+    history.append({"stage": "rejected", "timestamp": now().isoformat()})
+    await db.applications_col.update_one(
+        {"_id": ObjectId(application_id)},
+        {"$set": {"stage": "rejected", "stage_history": history, "rejection_message": payload.message}}
+    )
+
+    # Send rejection message to candidate inbox
+    rej_msg = {
+        "application_id": application_id,
+        "from_id": employer_id,
+        "from_name": employer["name"] if employer else "Employer",
+        "to_id": app_doc["candidate_id"],
+        "content": payload.message,
+        "msg_type": "rejection",
+        "job_title": job["title"] if job else "",
+        "timestamp": now().isoformat(),
+        "read": False,
+    }
+    rej_ins = await db.messages_col.insert_one(rej_msg)
+    rej_msg["_id"] = rej_ins.inserted_id
+    await emit_new_message(rej_msg)
+
+    # Agent feed notification
+    await db.agent_activities_col.insert_one({
+        "candidate_id": app_doc["candidate_id"],
+        "type": "rejected",
+        "message": f"Application for {job['title'] if job else 'a role'} was not moved forward.",
+        "job_id": app_doc.get("job_id", ""),
+        "job_title": job["title"] if job else "",
+        "timestamp": now().isoformat(),
+        "read": False,
+    })
+    return {"success": True}
+
+@app.put("/api/employer/applications/{application_id}/ai-interview/override")
+async def override_ai_interview(
+    application_id: str,
+    payload: AiInterviewOverrideRequest,
+    employer_id: str,
+):
+    try:
+        app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid application_id")
+    if not app_doc:
+        raise HTTPException(404, "Application not found")
+
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc.get("job_id"))}) if app_doc.get("job_id") else None
+    if job and job.get("employer_id") != employer_id:
+        raise HTTPException(403, "Forbidden")
+
+    before = {
+        "interview_score": app_doc.get("interview_score", app_doc.get("ai_score", None)),
+        "recommendation": app_doc.get("recommendation", None),
+        "stage": app_doc.get("stage", None),
+    }
+
+    update_fields = {
+        "overridden_by_employer": True,
+        "last_updated": now().isoformat(),
+    }
+
+    after = dict(before)
+    if payload.score is not None:
+        update_fields["interview_score"] = payload.score
+        update_fields["ai_score"] = payload.score
+        after["interview_score"] = payload.score
+    if payload.recommendation is not None:
+        update_fields["recommendation"] = payload.recommendation
+        after["recommendation"] = payload.recommendation
+    if payload.stage is not None:
+        update_fields["stage"] = payload.stage
+        after["stage"] = payload.stage
+
+    # Update application fields
+    await db.applications_col.update_one({"_id": ObjectId(application_id)}, {"$set": update_fields})
+
+    # If stage was overridden, add a stage_history entry for transparency.
+    if payload.stage is not None:
+        history = list(app_doc.get("stage_history", []))
+        history.append({
+            "stage": payload.stage,
+            "timestamp": now().isoformat(),
+            "note": payload.note or "Overridden by employer (AI interview HITL).",
+        })
+        await db.applications_col.update_one({"_id": ObjectId(application_id)}, {"$set": {"stage_history": history}})
+
+    # Audit log entry
+    await db.ai_interview_override_audit_col.insert_one({
+        "application_id": application_id,
+        "employer_id": employer_id,
+        "candidate_id": app_doc.get("candidate_id", ""),
+        "timestamp": now().isoformat(),
+        "before": before,
+        "after": after,
+        "note": payload.note or "",
+    })
+
+    return {"success": True, "before": before, "after": after}
+
+
+@app.post("/api/employer/applications/{application_id}/message")
+async def employer_send_message(application_id: str, payload: MessageCreate, employer_id: str):
+    app_doc = await db.applications_col.find_one({"_id": ObjectId(application_id)})
+    if not app_doc:
+        raise HTTPException(404, "Not found")
+    employer = await db.users_col.find_one({"_id": ObjectId(employer_id)})
+    job = await db.jobs_col.find_one({"_id": ObjectId(app_doc["job_id"])})
+    if job and job.get("employer_id") != employer_id:
+        raise HTTPException(403, "You cannot message this candidate")
+    em_msg = {
+        "application_id": application_id,
+        "from_id": employer_id,
+        "from_name": employer["name"] if employer else "Employer",
+        "to_id": app_doc["candidate_id"],
+        "content": payload.content,
+        "msg_type": payload.msg_type,
+        "job_title": job["title"] if job else "",
+        "timestamp": now().isoformat(),
+        "read": False,
+    }
+    em_ins = await db.messages_col.insert_one(em_msg)
+    em_msg["_id"] = em_ins.inserted_id
+    await emit_new_message(em_msg)
+    return {"success": True}
+
+
+@app.get("/api/employer/applications/{application_id}/messages")
+async def get_application_messages(application_id: str):
+    cursor = db.messages_col.find({"application_id": application_id}).sort("timestamp", 1)
+    msgs = await cursor.to_list(200)
+    return _ids(msgs)
+
+
+async def _get_stage_counts(job_id: str) -> dict:
+    stages = ["matched", "screened", "interview", "assignment", "offer", "rejected"]
+    counts = {}
+    for stage in stages:
+        counts[stage] = await db.applications_col.count_documents({"job_id": job_id, "stage": stage})
+    counts["total"] = await db.applications_col.count_documents({"job_id": job_id})
+    return counts
+
+
+@app.get("/api/employer/analytics/{employer_id}")
+async def get_employer_analytics(employer_id: str):
+    cursor = db.jobs_col.find({"employer_id": employer_id})
+    jobs = await cursor.to_list(100)
+    analytics = []
+    for job in jobs:
+        jid = str(job["_id"])
+        counts = await _get_stage_counts(jid)
+        analytics.append({
+            "job_id": jid,
+            "job_title": job["title"],
+            "status": job.get("status", "active"),
+            "created_at": job.get("created_at", ""),
+            "stage_counts": counts,
+        })
+    return analytics
+
+
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
 
 
 if __name__ == "__main__":
