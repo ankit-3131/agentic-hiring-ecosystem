@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: hsl(240 10% 8%);
+  --color-foreground: hsl(0 0% 98%);
+  --color-card: hsl(240 10% 12%);
+  --color-card-hover: hsl(240 10% 15%);
+  --color-card-foreground: hsl(0 0% 98%);
+  --color-primary: hsl(142 71% 45%);
+  --color-primary-foreground: hsl(0 0% 100%);
+  --color-secondary: hsl(255 85% 75%);
+  --color-secondary-foreground: hsl(0 0% 100%);
+  --color-warning: hsl(41 96% 60%);
+  --color-muted: hsl(240 5% 20%);
+  --color-muted-foreground: hsl(240 5% 65%);
+  --color-destructive: hsl(0 84% 60%);
+  --color-destructive-foreground: hsl(0 0% 98%);
+  --color-border: hsl(240 10% 20%);
+  --color-input: hsl(240 10% 20%);
+  --font-family-sans: 'Inter', system-ui, sans-serif;
+  --radius-DEFAULT: 0.75rem;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-family-sans);
+}
+
+.glass-card {
+  background-color: color-mix(in srgb, var(--color-card) 80%, transparent);
+  backdrop-filter: blur(12px);
+  border: 1px solid color-mix(in srgb, white 5%, transparent);
+  border-radius: var(--radius-DEFAULT);
+}
+
+.role-badge {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 9999px;
+  background-color: color-mix(in srgb, var(--color-secondary) 10%, transparent);
+  color: var(--color-secondary);
+  border: 1px solid color-mix(in srgb, var(--color-secondary) 20%, transparent);
+}

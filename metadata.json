@@ -1,0 +1,5 @@
+{
+  "name": "Hire Sphere AI",
+  "description": "An application for screening job applicants using AI. It processes resumes to extract skills, experience, and education, then scores candidates based on job-specific criteria, providing a ranked list for HR.",
+  "requestFramePermissions": []
+}
