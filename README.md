@@ -4,6 +4,9 @@
 
 [![Live Demo](https://img.shields.io/badge/Live-Demo-blue?style=for-the-badge)](https://ai-hiring-pvt.vercel.app/)
 
+https://ai-hiring-pvt.vercel.app/
+ (You can also login through demo accounts of employer and candidate)
+
 An agentic hiring platform where AI agents—not job boards—connect candidates, companies, agencies, and hiring tools in a single ecosystem. Candidates apply once to create a persistent AI profile that matches them across all connected employers. Every job creates its own AI agent that coordinates candidate discovery, screening, interviews, and hiring through configurable workflows.
 
 ## 🌟 Key Features
@@ -37,6 +40,18 @@ An agentic hiring platform where AI agents—not job boards—connect candidates
 - **Skill Gap Reports**: Personalized development recommendations for candidates
 - **Interview Analytics**: Detailed breakdown of interview performance by competency
 - **Application Tracking**: Real-time visibility into application status and stage progression
+
+### Proper API Documentation through Redoc
+<img width="1902" height="887" alt="image" src="https://github.com/user-attachments/assets/b333d9d6-a2fc-4c28-ab57-069ae4a9d34f" />
+
+
+
+# Screenshots from the webapp:
+<img width="1487" height="772" alt="image" src="https://github.com/user-attachments/assets/59c26d4a-968a-4ca3-83b9-96eb7ba99fc8" />
+
+<img width="1917" height="866" alt="image" src="https://github.com/user-attachments/assets/a77ca502-1ec0-4dbf-816c-e1b7de44adef" />
+<img width="1867" height="793" alt="image" src="https://github.com/user-attachments/assets/2688a0ea-7725-4234-a094-0122cd89a2b4" />
+<img width="1690" height="797" alt="image" src="https://github.com/user-attachments/assets/40613816-19d5-4c9b-8de3-5f51ff9eff5a" />
 
 ## 🏗️ Architecture
 
